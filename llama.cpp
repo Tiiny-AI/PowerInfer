@@ -6,6 +6,7 @@
 #include "ggml.h"
 
 #include "ggml-alloc.h"
+#include "llama-gpu-split.h"
 
 #ifdef GGML_USE_CUBLAS
 #  include "ggml-cuda.h"
@@ -2754,30 +2755,6 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
 }
 
 
-static int64_t sum_gpu_index(struct ggml_tensor * gpu_index) {
-    ggml_context * ctx_aux = ggml_init({
-        /* mem_size */ 1 << 10,
-    });
-
-    GGML_ASSERT(ctx_aux);
-
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx_aux, 1, false);
-    ggml_tensor * sum = ggml_sum(ctx_aux, gpu_index);
-
-    ggml_set_name(sum, "gpu_index_sum");
-    ggml_build_forward_expand(gf, sum);
-
-    // TODO: +1 worker for GPU under hybrid inference but no use
-    // ggml_graph_compute_helper(work_buffer, gf, 2);
-    ggml_graph_compute_with_ctx(ctx_aux, gf, 2);
-
-    int32_t sum_val = ggml_get_i32_1d(sum, 0);
-
-    ggml_free(ctx_aux);
-
-    return sum_val;
-}
-
 struct llama_gpu_split_loader {
     int n_tensors = 0;
     size_t n_bytes = 0; // tensor data bytes
@@ -2827,27 +2804,60 @@ struct llama_gpu_split_loader {
         LLAMA_LOG_INFO("%s: applying gpu_idx adapter from '%s' - please wait ...\n", __func__, fname.c_str());
         const int64_t t_start_mlp_us = ggml_time_us();
 
+        std::vector<ggml_tensor *> gpu_indices(n_layers);
+        std::vector<ggml_tensor *> gpu_buckets(n_layers);
+        std::vector<int64_t> selected(n_layers);
         for (int il = 0; il < n_layers; il++) {
-            llama_layer &model_layer = model->layers[il];
-            ggml_tensor * gpu_idx = idx_loader->get_tensor_meta(il*2);
-            ggml_tensor * gpu_bucket = idx_loader->get_tensor_meta(il*2+1);
-            if (gpu_idx == nullptr || gpu_bucket == nullptr) {
-                LLAMA_LOG_ERROR("%s: error: failed to load gpu index or bucket\n", __func__);
+            const llama_layer & layer = model->layers[il];
+            ggml_tensor * gpu_idx = ggml_get_tensor(idx_loader->ctx_meta, format("blk.%d.gpu_idx", il).c_str());
+            ggml_tensor * gpu_bucket = ggml_get_tensor(idx_loader->ctx_meta, format("blk.%d.gpu_bucket", il).c_str());
+            std::string error;
+            if (!layer.ffn_up || !layer.ffn_down_t ||
+                layer.ffn_down_t->ne[1] != layer.ffn_up->ne[1] ||
+                (layer.ffn_gate && layer.ffn_gate->ne[1] != layer.ffn_up->ne[1]) ||
+                !llama_gpu_split::validate_layout(gpu_idx, gpu_bucket, layer.ffn_up->ne[1], error)) {
+                LLAMA_LOG_ERROR("%s: error: invalid GPU split for layer %d: %s\n", __func__, il,
+                    error.empty() ? "FFN tensors have incompatible row counts" : error.c_str());
                 return 1;
             }
-            model_layer.gpu_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU);
-            model_layer.gpu_bucket = idx_loader->create_tensor_for(ctx_meta, gpu_bucket, GGML_BACKEND_CPU);
+            // Validate sidecar data ranges before mapping and dereferencing any values.
+            // Subtraction avoids overflow when a file-controlled offset is very large.
+            for (const ggml_tensor * tensor : { gpu_idx, gpu_bucket }) {
+                const int id = gguf_find_tensor(idx_loader->ctx_gguf, ggml_get_name(tensor));
+                const uint64_t base = gguf_get_data_offset(idx_loader->ctx_gguf);
+                const uint64_t offset = gguf_get_tensor_offset(idx_loader->ctx_gguf, id);
+                const uint64_t size = idx_loader->file.size;
+                if (base > size || offset > size - base || ggml_nbytes(tensor) > size - base - offset) {
+                    LLAMA_LOG_ERROR("%s: error: GPU split tensor '%s' extends beyond the sidecar file\n",
+                        __func__, ggml_get_name(tensor));
+                    return 1;
+                }
+            }
+            gpu_indices[il] = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU);
+            gpu_buckets[il] = idx_loader->create_tensor_for(ctx_meta, gpu_bucket, GGML_BACKEND_CPU);
         }
         llama_progress_callback cb = [](float progress, void *ctx) {
             LLAMA_LOG_INFO(".");
         };
         idx_loader->load_all_data(ctx_meta, cb, nullptr, nullptr);
 
+        // Reject the entire cache before publishing any layer state or uploading data.
+        // The caller may regenerate a rejected cache or fall back to an empty split.
+        for (int il = 0; il < n_layers; il++) {
+            std::string error;
+            if (!llama_gpu_split::validate(gpu_indices[il], gpu_buckets[il],
+                    model->layers[il].ffn_up->ne[1], selected[il], error)) {
+                LLAMA_LOG_ERROR("%s: error: invalid GPU split for layer %d: %s\n", __func__, il, error.c_str());
+                return 1;
+            }
+        }
         for (int il = 0; il < n_layers; il++) {
             llama_layer &model_layer = model->layers[il];
-            ggml_tensor * gpu_idx = model_layer.gpu_idx;
-            ggml_tensor * gpu_bucket = model_layer.gpu_bucket;
-            int64_t gpu_neurons = sum_gpu_index(gpu_idx);
+            ggml_tensor * gpu_idx = gpu_indices[il];
+            ggml_tensor * gpu_bucket = gpu_buckets[il];
+            model_layer.gpu_idx = gpu_idx;
+            model_layer.gpu_bucket = gpu_bucket;
+            int64_t gpu_neurons = selected[il];
             model_layer.gpu_offload_ratio = (double)gpu_neurons / gpu_idx->ne[0];
             if (gpu_neurons == 0 || gpu_neurons == gpu_idx->ne[0]) {
                 // no hybrid inference for this layer, unset gpu_bucket
@@ -2897,6 +2907,9 @@ struct llama_augmentation_model_loader {
         // allocate and copy selected weights to gpu
     ggml_tensor * create_striped_mat_to_gpu(struct ggml_tensor *src, struct ggml_tensor * gpu_bucket) {
 #ifdef GGML_USE_CUBLAS
+        if (!src || !src->data || src->ne[1] <= 0) {
+            throw std::runtime_error(format("%s: invalid source tensor", __func__));
+        }
         if (gpu_bucket == NULL) {
             // offload the whole tensor to gpu
             ggml_set_backend(src, GGML_BACKEND_GPU);
@@ -2904,9 +2917,13 @@ struct llama_augmentation_model_loader {
             return src;
         }
 
+        std::string error;
+        if (!llama_gpu_split::validate_bucket(gpu_bucket, src->ne[1], error) || gpu_bucket->ne[0] == 0) {
+            throw std::runtime_error(format("%s: invalid GPU bucket: %s", __func__,
+                error.empty() ? "cannot slice an empty bucket" : error.c_str()));
+        }
         int64_t row_len = src->ne[0];
         int64_t gpu_rows = gpu_bucket->ne[0];
-        GGML_ASSERT(0 < gpu_rows && gpu_rows <= src->ne[1]);
 
         ggml_set_no_alloc(aux_ctx, true);
         ggml_tensor * gpu_dst = ggml_new_tensor_2d(aux_ctx, src->type, row_len, gpu_rows);

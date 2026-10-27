@@ -45,6 +45,11 @@ llama_build_and_test_executable(test-grad0.cpp) # SLOW
 
 llama_build_and_test_executable(test-rope.cpp)
 
+# Host-side sidecar validation does not require a GPU or model weights.
+add_executable(test-gpu-split test-gpu-split.cpp)
+target_link_libraries(test-gpu-split PRIVATE ggml)
+add_test(NAME test-gpu-split COMMAND test-gpu-split)
+
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)

@@ -678,6 +678,7 @@ endif()
 add_library(llama
             llama.cpp
             llama.h
+            llama-gpu-split.h
             )
 
 target_include_directories(llama PUBLIC .)
